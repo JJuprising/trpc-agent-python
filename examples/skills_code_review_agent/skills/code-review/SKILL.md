@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: Review unified diffs, file lists, or Git worktree changes inside an isolated workspace and return evidence-based findings. Use for changed-code review by default and for full-repository review only when explicitly requested.
+description: Review unified diffs, file lists, Git worktree changes, or committed commit ranges inside an isolated workspace and return evidence-based findings. Use for changed-code review by default and for full-repository review only when explicitly requested.
 ---
 
 # Code Review
@@ -47,37 +47,50 @@ composition to bypass the approved scripts.
    `python3 scripts/review_git_changes.py work/inputs --mode staged`. Each
    returns the same bounded records as the diff runner; follow `next_cursor`
    with `--cursor <next_cursor> --limit 24`.
-4. Inspect untracked source files reported by Git, but do not open likely secret
+4. For a committed commit range, the workspace is checked out at the head
+   commit and the review target is the recorded `base..head` range. Collect
+   the diff with
+   `python3 scripts/review_git_changes.py work/inputs --mode commit
+   --base <base> --head <head>`; it returns the same bounded records as the
+   diff runner, so follow `next_cursor` with `--cursor <next_cursor>
+   --limit 24`. Inspect every file reported by the diff through
+   `python3 scripts/inspect_files.py work/inputs --scope commit
+   --base <base> --head <head> --path <relative-path>`; repeat `--path` for
+   batches of no more than twelve paths, with no more than three files per
+   output page. These are the only permitted command shapes for this branch;
+   do not run Git directly and do not review code outside the recorded range
+   except for the minimum context needed to validate a finding.
+5. Inspect untracked source files reported by Git, but do not open likely secret
    files such as `.env`, credentials, keys, or tokens. Read small batches with
    `python3 scripts/inspect_files.py work/inputs --scope changed --path
    <relative-path>`;
    repeat `--path` for additional files, with no more than three files per
    output page. Follow `next_cursor` when a larger declared batch is paginated.
-5. For explicit full scope, enumerate tracked files with
+6. For explicit full scope, enumerate tracked files with
    `python3 scripts/inspect_git_files.py work/inputs --mode tracked`, following
    `next_cursor` with `--cursor <next_cursor> --limit 12`. Inspect relevant
    files in `inspect_files.py --scope full --path` batches. Never request more
    than twelve paths in one command or more than three files per page.
-6. Read the minimum unchanged context needed to verify each potential finding.
-7. Run bounded static checks or targeted unit tests only when current evidence
+7. Read the minimum unchanged context needed to verify each potential finding.
+8. Run bounded static checks or targeted unit tests only when current evidence
    makes them necessary. Unit-test execution is disabled unless the operator
    explicitly trusts the mounted repository. Prefer the non-executing
    `python3 -m compileall`; use `unittest` or `pytest` only after that explicit
    opt-in. Never install packages, start services, or invoke application entry
    points.
-8. Treat script results as candidates rather than final findings. Reject
+9. Treat script results as candidates rather than final findings. Reject
    candidates that lack concrete changed-code evidence.
-9. Deduplicate by `(file, line, category)`. Put low-confidence candidates in
-   `warnings` or `needs_human_review`, not in `findings`.
-10. Report `severity`, `category`, `file`, `line`, `title`, `evidence`,
-   `recommendation`, `confidence`, and `source` for every issue.
-11. List only checks that were actually performed.
-12. If pagination, timeout, truncation, or another budget prevents complete
+10. Deduplicate by `(file, line, category)`. Put low-confidence candidates in
+    `warnings` or `needs_human_review`, not in `findings`.
+11. Report `severity`, `category`, `file`, `line`, `title`, `evidence`,
+    `recommendation`, `confidence`, and `source` for every issue.
+12. List only checks that were actually performed.
+13. If pagination, timeout, truncation, or another budget prevents complete
     inspection, record the limitation in `needs_human_review`; never claim the
     whole input was reviewed.
-13. For paginated Git helpers, require the same `input_digest` on every page.
+14. For paginated Git helpers, require the same `input_digest` on every page.
     If it changes, stop using that evidence and request human review.
-14. Treat a Git file record marked `truncated` or `normalized` as incomplete
+15. Treat a Git file record marked `truncated` or `normalized` as incomplete
     scope evidence. Do not invent the original path; request human review.
 
 Prioritize correctness, security, data loss, compatibility, and meaningful

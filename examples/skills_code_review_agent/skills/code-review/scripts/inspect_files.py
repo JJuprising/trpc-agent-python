@@ -4,6 +4,7 @@
 import argparse
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -93,6 +94,37 @@ def _redact(value: str) -> str:
     for pattern, replacement in SECRET_PATTERNS:
         value = pattern.sub(replacement, value)
     return value
+
+
+COMMIT_REF = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+
+def _commit_range_paths(
+    repository: Path, base_commit: str, head_commit: str
+) -> set[str]:
+    """Paths changed between two commits; the only readable set for commit scope."""
+    repository = repository.resolve()
+    if not repository.is_dir() or not (repository / ".git").exists():
+        raise ValueError(f"not a Git worktree: {repository}")
+    completed = subprocess.run(
+        [
+            "git", "-C", str(repository), "diff", "--name-only",
+            "--find-renames", f"{base_commit}..{head_commit}",
+        ],
+        check=False,
+        capture_output=True,
+        timeout=20,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.decode("utf-8", errors="replace")[:1000]
+        raise ValueError(f"Git file listing failed: {message}")
+    if len(completed.stdout) > MAX_LIST_BYTES:
+        raise ValueError(f"Git file listing exceeds {MAX_LIST_BYTES} bytes")
+    return {
+        line
+        for line in completed.stdout.decode("utf-8", errors="replace").splitlines()
+        if line.strip()
+    }
 
 
 def _safe_text(value: str) -> str:
@@ -243,7 +275,9 @@ def main() -> int:
     )
     parser.add_argument("--cursor", type=int, default=0)
     parser.add_argument("--limit", type=int, default=MAX_PAGE_FILES)
-    parser.add_argument("--scope", choices=("changed", "full"))
+    parser.add_argument("--scope", choices=("changed", "full", "commit"))
+    parser.add_argument("--base", help="base commit for --scope commit")
+    parser.add_argument("--head", help="head commit for --scope commit")
     args = parser.parse_args()
     if (args.file_list is None) == (not args.path):
         parser.error("provide either file_list or one or more --path values")
@@ -251,18 +285,35 @@ def main() -> int:
         if args.path:
             if args.scope is None:
                 raise ValueError("direct repository inspection requires --scope")
+            if args.scope == "commit":
+                if not args.base or not args.head:
+                    raise ValueError(
+                        "commit scope requires --base and --head"
+                    )
+                if not COMMIT_REF.fullmatch(args.base) or not COMMIT_REF.fullmatch(args.head):
+                    raise ValueError(
+                        "commit references must be hexadecimal object names"
+                    )
+                allowed_paths = _commit_range_paths(
+                    args.root, args.base, args.head
+                )
+            else:
+                if args.base or args.head:
+                    raise ValueError(
+                        "--base/--head are only valid with --scope commit"
+                    )
+                mode = "tracked" if args.scope == "full" else "changed"
+                allowed_paths = {
+                    str(item["path"])
+                    for item in collect_files(args.root, mode)
+                    if item.get("path")
+                    and not item.get("truncated")
+                    and not item.get("normalized")
+                }
             if len(args.path) > MAX_DIRECT_PATHS:
                 raise ValueError(
                     f"direct selection exceeds {MAX_DIRECT_PATHS} paths"
                 )
-            mode = "tracked" if args.scope == "full" else "changed"
-            allowed_paths = {
-                str(item["path"])
-                for item in collect_files(args.root, mode)
-                if item.get("path")
-                and not item.get("truncated")
-                and not item.get("normalized")
-            }
             result = inspect_paths(
                 args.root,
                 args.path,

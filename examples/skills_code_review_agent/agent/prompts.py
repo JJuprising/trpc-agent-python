@@ -40,6 +40,13 @@ by file, line, and category. Put confidence below 0.70 in warnings or
 needs_human_review instead of findings. Do not report style-only preferences
 unless they create a material maintenance risk. Use `null`, never `0` or `-1`,
 when a line number is unknown. Finish with the required structured response.
+
+The final structured response MUST match the review_analysis schema exactly:
+a top-level `summary` string plus the `findings`, `warnings`, and
+`needs_human_review` arrays. Never return an error object, a `status` field,
+or any other shape, even when execution was blocked or incomplete. In that
+case still return the schema: explain what happened in `summary`, keep
+`findings` empty, and record the limitation as a `needs_human_review` entry.
 """.strip()
 
 
@@ -79,7 +86,7 @@ def build_review_request(
     # Never disclose a caller's absolute host path to the model provider.
     display_source = (
         "work/inputs"
-        if input_summary.kind == "git_worktree"
+        if input_summary.kind in {"git_worktree", "git_commit_range"}
         else input_summary.source
     )
     if scope is ReviewScope.FULL:
@@ -101,6 +108,28 @@ def build_review_request(
             "collect staged/unstaged diffs only through the loaded Skill's "
             "paginated Git helper commands. Use `--scope changed` for every "
             "controlled direct file read."
+        )
+    elif input_summary.kind == "git_commit_range":
+        base = input_summary.base_commit or ""
+        head = input_summary.head_commit or ""
+        diff_command = (
+            "python3 scripts/review_git_changes.py work/inputs "
+            f"--mode commit --base {base} --head {head}"
+        )
+        read_prefix = (
+            "python3 scripts/inspect_files.py work/inputs "
+            f"--scope commit --base {base} --head {head}"
+        )
+        input_instruction = (
+            "Inspect the Git worktree mounted at work/inputs; it is checked out "
+            f"at the head commit. The committed range base {base}..head {head} "
+            "is the review target. Collect the diff only with the paginated "
+            f"command `{diff_command}`, optionally followed by "
+            "`--cursor <next_cursor> --limit 24`; continue until `next_cursor` "
+            "is null or the execution budget is exhausted. Read context with "
+            f"`{read_prefix} --path <file>` in batches of at most 12 paths, and "
+            "inspect every file reported by the diff before finishing. Use only "
+            "these two command shapes; do not use git directly."
         )
     elif input_summary.kind == "diff_file":
         command = (

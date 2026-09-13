@@ -2222,6 +2222,7 @@ class OpenAIModel(LLMModel):
         api_params[ApiParamsKey.STREAM_OPTS] = {ApiParamsKey.INCLUDE_USAGE: True}
 
         client = self._create_async_client()
+        response: Any = None
         logger.debug("openai invoke with params: %s", api_params)
         try:
             response = await client.chat.completions.create(**api_params, **http_options)
@@ -2441,4 +2442,11 @@ class OpenAIModel(LLMModel):
                 custom_metadata={"stream_complete": True},
             )
         finally:
-            await self._http_client_provider.close_http_client(client)
+            # Close the response stream before its client.  Without this explicit
+            # close, the underlying httpcore stream may survive until async-generator
+            # finalization during interpreter shutdown.
+            try:
+                if response is not None and hasattr(response, "aclose"):
+                    await response.aclose()
+            finally:
+                await self._http_client_provider.close_http_client(client)

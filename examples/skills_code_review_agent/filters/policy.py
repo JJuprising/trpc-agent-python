@@ -16,6 +16,9 @@ from pydantic import Field
 from reports.models import FilterDecision
 from security import is_likely_secret_path
 
+# Commit references accepted for committed-range reviews (hex SHA-like only).
+COMMIT_REF = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
 
 @dataclass(frozen=True)
 class ReviewPolicyContext:
@@ -24,6 +27,8 @@ class ReviewPolicyContext:
     input_kind: str
     source: str
     scope: str
+    base_commit: str | None = None
+    head_commit: str | None = None
 
 
 class SandboxCommand(BaseModel):
@@ -148,6 +153,84 @@ class CommandPolicy:
             options = options[2:]
         return None
 
+    def _evaluate_commit_range(self, tokens: list[str]) -> tuple[str, str] | None:
+        """Allowlist commands for committed base..head reviews."""
+        expected_base = self.context.base_commit or ""
+        expected_head = self.context.head_commit or ""
+
+        def matching_refs(base: str, head: str) -> bool:
+            return bool(
+                base == expected_base
+                and head == expected_head
+                and COMMIT_REF.fullmatch(base)
+                and COMMIT_REF.fullmatch(head)
+            )
+
+        if tokens[:3] == [
+            "python3",
+            "scripts/review_git_changes.py",
+            "work/inputs",
+        ]:
+            options = tokens[3:]
+            if (
+                len(options) < 6
+                or options[0:2] != ["--mode", "commit"]
+                or options[2] != "--base"
+                or options[4] != "--head"
+            ):
+                return self._deny_reason(
+                    "Git diff collection must use --mode commit with base and head"
+                )
+            if not matching_refs(options[3], options[5]):
+                return self._deny_reason(
+                    "Git diff commit range does not match the review request"
+                )
+            return self._validate_pagination(options[6:], max_limit=24)
+
+        if tokens[:3] == [
+            "python3",
+            "scripts/inspect_files.py",
+            "work/inputs",
+        ]:
+            options = tokens[3:]
+            paths: list[str] = []
+            pagination: list[str] = []
+            scopes: list[str] = []
+            refs: dict[str, str] = {}
+            while options:
+                if len(options) < 2:
+                    return self._deny_reason("repository inspection option is incomplete")
+                option, value = options[:2]
+                if option == "--path":
+                    paths.append(value)
+                elif option == "--scope":
+                    scopes.append(value)
+                elif option == "--base":
+                    refs["base"] = value
+                elif option == "--head":
+                    refs["head"] = value
+                elif option in {"--cursor", "--limit"}:
+                    pagination.extend((option, value))
+                else:
+                    return self._deny_reason("unsupported repository inspection option")
+                options = options[2:]
+            if not paths:
+                return self._deny_reason("repository inspection requires --path")
+            if scopes != ["commit"]:
+                return self._deny_reason(
+                    "commit-range inspection requires --scope commit"
+                )
+            if not matching_refs(refs.get("base", ""), refs.get("head", "")):
+                return self._deny_reason(
+                    "commit-range inspection does not match the review request"
+                )
+            if len(paths) > 12:
+                return self._deny_reason("repository inspection path batch is too large")
+            if any(is_likely_secret_path(path) for path in paths):
+                return self._deny_reason("likely secret files require human review")
+            return self._validate_pagination(pagination, max_limit=3)
+        return self._deny_reason("command is not valid for commit-range review")
+
     def _evaluate_review_context(self, tokens: list[str]) -> tuple[str, str] | None:
         """Apply input-mode rules after the generic command checks pass."""
         if self.context is None:
@@ -155,6 +238,8 @@ class CommandPolicy:
         kind = self.context.input_kind
         if self.context.scope not in {"changed", "full"}:
             return self._deny_reason("unsupported review scope")
+        if kind == "git_commit_range":
+            return self._evaluate_commit_range(tokens)
         if kind in {"diff_file", "fixture"}:
             filename = Path(self.context.source).name
             if kind == "fixture":

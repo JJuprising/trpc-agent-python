@@ -9,6 +9,7 @@ skills_code_review_agent/
 ├── run_agent.py                  # 主要入口
 ├── workflow.py                   # 审查流程编排
 ├── docs/design.md                # 方案设计说明
+├── docs/tutorial.md              # 分模块学习与扩展教程
 ├── agent/
 │   ├── agent.py                  # LlmAgent 构建
 │   ├── config.py                 # 模型配置
@@ -217,3 +218,6 @@ uv run --project examples/skills_code_review_agent --with-editable . \
 ```
 
 详细取舍见 [docs/design.md](./docs/design.md)。
+
+想系统学习项目架构、工具调用、安全边界和扩展方法，请阅读
+[docs/tutorial.md](./docs/tutorial.md)。

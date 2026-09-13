@@ -4,16 +4,20 @@ import asyncio
 import hashlib
 import json
 import shlex
+import sys
 import time
 import uuid
 from dataclasses import dataclass
+from dataclasses import replace
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
+from typing import Any
 
 from trpc_agent_sdk.context import new_agent_context
 from trpc_agent_sdk.runners import Runner
 from trpc_agent_sdk.sessions import InMemorySessionService
+from trpc_agent_sdk.tools import SetModelResponseTool
 from trpc_agent_sdk.types import Content
 from trpc_agent_sdk.types import Part
 
@@ -22,9 +26,12 @@ from agent.agent import create_review_agent
 from agent.config import ModelConfig
 from agent.config import ReviewLimits
 from agent.fake import analyze_with_fake_model
+from agent.model_io import ModelIoRecorder
 from agent.normalization import normalize_analysis
 from agent.normalization import enforce_analysis_scope
+from agent.prompts import INSTRUCTION
 from agent.prompts import build_review_request
+from agent.tools import SAFE_SKILL_TOOLS
 from filters.policy import SandboxCommand
 from filters.policy import ReviewPolicyContext
 from filters.sdk_filter import FILTER_DECISIONS_METADATA_KEY
@@ -32,8 +39,11 @@ from inputs.models import ParsedReviewInput
 from inputs.parser import parse_diff_file
 from inputs.parser import parse_file_list
 from inputs.parser import parse_fixture
+from inputs.parser import parse_git_commit_range
 from inputs.parser import parse_git_worktree
 from inputs.parser import cleanup_parsed_input
+from observability import RunTraceWriter
+from observability import build_review_run_trace
 from reports.models import FilterDecision
 from reports.models import MonitoringSummary
 from reports.models import ReviewAnalysis
@@ -60,6 +70,8 @@ class ReviewRequest:
     diff_file: Path | None = None
     file_list: Path | None = None
     fixture: str | None = None
+    base_commit: str | None = None
+    head_commit: str | None = None
     scope: ReviewScope = ReviewScope.CHANGED
     fake_model: bool = False
     dry_run: bool = False
@@ -101,6 +113,7 @@ class CodeReviewWorkflow:
         report_writer: ReportWriter,
         skills_path: Path,
         limits: ReviewLimits | None = None,
+        trace: bool = False,
     ) -> None:
         self.model_config = model_config
         self.sandbox = sandbox
@@ -108,19 +121,69 @@ class CodeReviewWorkflow:
         self.report_writer = report_writer
         self.skills_path = skills_path
         self.limits = limits or ReviewLimits()
+        self.trace = trace
+        self._trace_lines: list[str] = []
+        self._agent_context_snapshot: dict[str, Any] | None = None
+        self._model_io_snapshot: dict[str, Any] | None = None
+
+    def _trace(self, event: str, **fields: object) -> None:
+        """Print a redacted, bounded trace without exposing raw review data."""
+        if not self.trace:
+            return
+        rendered = []
+        for key, value in fields.items():
+            text = redact_text(str(value)).replace("\r", " ").replace("\n", " ")
+            rendered.append(f"{key}={text[:400]!r}")
+        suffix = f" {' '.join(rendered)}" if rendered else ""
+        line = f"[trace] {event}{suffix}"
+        self._trace_lines.append(line)
+        print(line, file=sys.stderr, flush=True)
+
+    def _trace_filter_decisions(
+        self,
+        agent_context,
+        traced_decisions: set[str],
+    ) -> None:
+        """Print newly observed policy decisions in tool execution order."""
+        for decision in self._filter_decisions(agent_context):
+            if decision.decision_id in traced_decisions:
+                continue
+            traced_decisions.add(decision.decision_id)
+            self._trace(
+                "policy.decision",
+                decision=decision.decision,
+                command=decision.command[:240],
+                reason=decision.reason[:240],
+            )
 
     async def run(self, request: ReviewRequest) -> ReviewWorkflowResult:
         """Execute a review without letting sandbox failures suppress reports."""
+        self._trace_lines = []
+        self._agent_context_snapshot = None
+        self._model_io_snapshot = None
         started = time.perf_counter()
         created_at = datetime.now(timezone.utc)
         task_id = str(uuid.uuid4())
         self.store.initialize()
         repository = self._request_repository_label(request)
         self.store.start_task(task_id, created_at, repository, request.scope)
+        self._trace(
+            "run.started",
+            task_id=task_id,
+            scope=request.scope.value,
+            mode="fake" if request.fake_model or request.dry_run else "real",
+        )
         parsed_input = None
         try:
             parsed_input = self._parse_input(request)
             parsed_input.summary.review_profile = self._review_profile(request)
+            self._trace(
+                "input.parsed",
+                kind=parsed_input.summary.kind,
+                file_count=parsed_input.summary.file_count,
+                hunk_count=parsed_input.summary.hunk_count,
+                digest=parsed_input.summary.digest[:12],
+            )
             return await self._run_parsed(
                 request,
                 parsed_input,
@@ -130,6 +193,11 @@ class CodeReviewWorkflow:
                 repository,
             )
         except BaseException as error:
+            self._trace(
+                "run.failed",
+                task_id=task_id,
+                error=f"{type(error).__name__}: {error}",
+            )
             try:
                 self.store.mark_task_failed(
                     task_id,
@@ -173,10 +241,13 @@ class CodeReviewWorkflow:
         parsed_input.exact_cache_available = cached_report is not None
         parsed_input.review_scope = request.scope.value
         fatal_failure = False
+        self._trace("cache.lookup", hit=cached_report is not None)
 
         if request.fake_model or request.dry_run:
+            self._trace("execution.selected", mode="fake" if request.fake_model else "dry-run")
             analysis, decisions, runs, tool_calls = self._run_fake(parsed_input)
         else:
+            self._trace("execution.selected", mode="real-agent")
             try:
                 analysis, decisions, runs, tool_calls = await asyncio.wait_for(
                     self._run_agent(
@@ -300,6 +371,14 @@ class CodeReviewWorkflow:
             conclusion=analysis.summary,
         )
         artifacts = self.report_writer.write(report)
+        self._trace(
+            "report.written",
+            task_id=task_id,
+            status=status,
+            findings=len(analysis.findings),
+            warnings=len(analysis.warnings),
+            needs_human_review=len(analysis.needs_human_review),
+        )
         try:
             self.store.save(report)
         except Exception as error:
@@ -318,6 +397,52 @@ class CodeReviewWorkflow:
             except Exception:
                 pass
             raise
+        self._trace("storage.saved", task_id=task_id)
+        if self.trace:
+            write_trajectory = getattr(self.report_writer, "write_trajectory", None)
+            if callable(write_trajectory):
+                trajectory_path = write_trajectory(task_id, self._trace_lines)
+                artifacts = replace(artifacts, trajectory_path=trajectory_path)
+            if self._agent_context_snapshot is not None:
+                write_agent_context = getattr(self.report_writer, "write_agent_context", None)
+                if callable(write_agent_context):
+                    context_path = write_agent_context(
+                        task_id,
+                        self._agent_context_snapshot,
+                    )
+                    artifacts = replace(artifacts, agent_context_path=context_path)
+                write_agent_io = getattr(self.report_writer, "write_agent_io", None)
+                if callable(write_agent_io):
+                    agent_io_path = write_agent_io(
+                        task_id,
+                        self._agent_context_snapshot,
+                        self._model_io_snapshot,
+                    )
+                    artifacts = replace(artifacts, agent_io_path=agent_io_path)
+            if self._model_io_snapshot is not None:
+                write_model_io = getattr(self.report_writer, "write_model_io", None)
+                if callable(write_model_io):
+                    model_io_path = write_model_io(task_id, self._model_io_snapshot)
+                    artifacts = replace(artifacts, model_io_path=model_io_path)
+            run_trace = build_review_run_trace(
+                report=report,
+                mode=(
+                    "fake"
+                    if request.fake_model
+                    else "dry-run"
+                    if request.dry_run
+                    else "real-agent"
+                ),
+                model_io=self._model_io_snapshot,
+                agent_context=self._agent_context_snapshot,
+                trace_lines=self._trace_lines,
+            )
+            trace_artifacts = RunTraceWriter(self.report_writer).write(run_trace)
+            artifacts = replace(
+                artifacts,
+                run_trace_json_path=trace_artifacts.json_path,
+                run_trace_markdown_path=trace_artifacts.markdown_path,
+            )
         return ReviewWorkflowResult(report=report, artifacts=artifacts)
 
     def _review_profile(self, request: ReviewRequest) -> str:
@@ -454,6 +579,8 @@ class CodeReviewWorkflow:
                 if parsed_input.review_scope == "full"
                 else {"files:changed", "diff:unstaged", "diff:staged"}
             )
+        elif kind == "git_commit_range":
+            required = {"diff:commit"}
         else:
             required = set()
 
@@ -480,6 +607,13 @@ class CodeReviewWorkflow:
                     f"{len(unread)} selected file(s) were not inspected "
                     "through the controlled reader"
                 )
+        elif kind == "git_commit_range":
+            unread = set(parsed_input.summary.files) - parsed_input.inspected_files
+            if unread:
+                issues.append(
+                    f"{len(unread)} commit-range file(s) were not inspected "
+                    "through the controlled reader"
+                )
         return issues
 
     @staticmethod
@@ -489,11 +623,17 @@ class CodeReviewWorkflow:
             or request.diff_file is not None
             or request.file_list is not None
             or request.fixture is not None
+            or request.base_commit is not None
+            or request.head_commit is not None
         ):
             raise ValueError("Full review requires only --repo-path")
         if request.file_list is not None:
             if request.diff_file is not None or request.fixture is not None:
                 raise ValueError("File list cannot be combined with diff or fixture input")
+            if request.base_commit is not None or request.head_commit is not None:
+                raise ValueError(
+                    "File list cannot be combined with commit range input"
+                )
             if (
                 request.repository_path is None
                 and not request.fake_model
@@ -501,6 +641,21 @@ class CodeReviewWorkflow:
             ):
                 raise ValueError("Real file-list review also requires --repo-path")
             return parse_file_list(request.file_list, request.repository_path)
+
+        if request.base_commit is not None or request.head_commit is not None:
+            if request.base_commit is None or request.head_commit is None:
+                raise ValueError("Commit range requires both base and head commits")
+            if request.diff_file is not None or request.fixture is not None:
+                raise ValueError(
+                    "Commit range cannot be combined with diff or fixture input"
+                )
+            if request.repository_path is None:
+                raise ValueError("Commit range review requires --repo-path")
+            return parse_git_commit_range(
+                request.repository_path,
+                request.base_commit,
+                request.head_commit,
+            )
 
         selected = sum(
             value is not None
@@ -526,6 +681,13 @@ class CodeReviewWorkflow:
             command = (
                 "python3 scripts/review_git_changes.py "
                 "work/inputs --mode unstaged"
+            )
+        elif parsed_input.summary.kind == "git_commit_range":
+            summary = parsed_input.summary
+            command = (
+                "python3 scripts/review_git_changes.py "
+                f"work/inputs --mode commit "
+                f"--base {summary.base_commit} --head {summary.head_commit}"
             )
         elif parsed_input.summary.kind in {"diff_file", "fixture"}:
             filename = Path(parsed_input.summary.source).name
@@ -580,6 +742,9 @@ class CodeReviewWorkflow:
     ) -> tuple[ReviewAnalysis, list[FilterDecision], list[SandboxRun], int]:
         if self.model_config is None or self.sandbox is None:
             raise ValueError("Real mode requires model and Docker sandbox configuration")
+        # 创建agent包括最基础的LlmAgent（tools，skill_repository参数，When set, the agent will use the skill repository to load skills.）
+        # ，还有绑定tool和skill，sandox放在了tools里
+        model_io_recorder = ModelIoRecorder() if self.trace else None
         review_agent = create_review_agent(
             self.model_config,
             self.sandbox,
@@ -589,7 +754,10 @@ class CodeReviewWorkflow:
                 input_kind=parsed_input.summary.kind,
                 source=parsed_input.summary.source,
                 scope=request.scope.value,
+                base_commit=parsed_input.summary.base_commit,
+                head_commit=parsed_input.summary.head_commit,
             ),
+            model_io_recorder=model_io_recorder,
         )
         session_service = InMemorySessionService()
         runner = Runner(
@@ -603,14 +771,33 @@ class CodeReviewWorkflow:
             user_id=user_id,
             session_id=session_id,
         )
+        task_instruction = build_review_request(
+            request.scope,
+            parsed_input.summary,
+            cached_report,
+        )
+        if self.trace:
+            self._agent_context_snapshot = {
+                "format": "agent-context-v2",
+                "description": (
+                    "Bounded, redacted record of content visible to the Agent and "
+                    "observable tool events. It does not contain hidden model reasoning."
+                ),
+                "system_instruction": self._bounded_context_value(INSTRUCTION),
+                "task_instruction": self._bounded_context_value(task_instruction),
+                "tool_contract": await self._agent_tool_contract(review_agent),
+                "output_contract": self._output_contract(),
+                "policy_context": {
+                    "input_kind": parsed_input.summary.kind,
+                    "source": self._bounded_context_value(parsed_input.summary.source),
+                    "scope": request.scope.value,
+                },
+                "events": [],
+            }
         message = Content(
             parts=[
                 Part.from_text(
-                    text=build_review_request(
-                        request.scope,
-                        parsed_input.summary,
-                        cached_report,
-                    )
+                    text=task_instruction
                 )
             ],
         )
@@ -618,6 +805,8 @@ class CodeReviewWorkflow:
         tool_calls = 0
         pending_runs: dict[str, tuple[str, float]] = {}
         sandbox_runs: list[SandboxRun] = []
+        traced_decisions: set[str] = set()
+        self._trace("agent.started", session_id=session_id)
 
         try:
             async for event in runner.run_async(
@@ -633,17 +822,56 @@ class CodeReviewWorkflow:
                         tool_calls += 1
                         if tool_calls > self.limits.max_tool_calls:
                             raise RuntimeError("review tool-call budget exhausted")
+                        call_id = part.function_call.id or f"call-{tool_calls}"
+                        call_fields = {
+                            "tool": part.function_call.name,
+                            "call_id": call_id,
+                        }
+                        if part.function_call.name == "skill_run":
+                            call_fields["command"] = str(
+                                (part.function_call.args or {}).get("command", "")
+                            )[:240]
+                        self._trace("tool.requested", **call_fields)
                         if part.function_call.name == "skill_run":
                             # Pair asynchronous call/response events to measure each run.
-                            call_id = part.function_call.id or str(uuid.uuid4())
                             command = str(
                                 (part.function_call.args or {}).get("command", "")
                             )[:4096]
                             pending_runs[call_id] = (command, time.perf_counter())
+                        self._record_agent_event(
+                            "tool_call",
+                            tool=part.function_call.name,
+                            call_id=call_id,
+                            arguments=part.function_call.args or {},
+                        )
                     elif part.function_response:
+                        response = part.function_response.response
+                        response_data = response if isinstance(response, dict) else {}
+                        stdout = str(response_data.get("stdout", ""))
+                        stderr = str(response_data.get("stderr", ""))
+                        self._trace_filter_decisions(
+                            agent_context,
+                            traced_decisions,
+                        )
+                        self._trace(
+                            "tool.responded",
+                            call_id=part.function_response.id,
+                            status=response_data.get("status", "success"),
+                            exit_code=response_data.get("exit_code"),
+                            timed_out=response_data.get("timed_out", False),
+                            duration_ms=response_data.get("duration_ms"),
+                            stdout_bytes=len(stdout.encode("utf-8")),
+                            stderr_bytes=len(stderr.encode("utf-8")),
+                            error=str(response_data.get("error", ""))[:200],
+                        )
+                        self._record_agent_event(
+                            "tool_response",
+                            tool=part.function_response.name,
+                            call_id=part.function_response.id,
+                            response=response,
+                        )
                         pending = pending_runs.pop(part.function_response.id, None)
                         if pending is not None:
-                            response = part.function_response.response
                             run = self._sandbox_run_from_response(pending, response)
                             sandbox_runs.append(run)
                             self._update_runtime_input(
@@ -651,6 +879,12 @@ class CodeReviewWorkflow:
                                 pending[0],
                                 response,
                             )
+                    elif getattr(part, "text", None) and not event.partial:
+                        self._record_agent_event(
+                            "model_message",
+                            text=getattr(part, "text"),
+                        )
+                self._trace_filter_decisions(agent_context, traced_decisions)
             session = await session_service.get_session(
                 app_name="skills_code_review_agent",
                 user_id=user_id,
@@ -678,6 +912,8 @@ class CodeReviewWorkflow:
             ) from error
         finally:
             await runner.close()
+            if model_io_recorder is not None:
+                self._model_io_snapshot = model_io_recorder.snapshot()
 
         if session is None or not session.state or OUTPUT_KEY not in session.state:
             analysis = ReviewAnalysis(
@@ -704,9 +940,112 @@ class CodeReviewWorkflow:
                 analysis = ReviewAnalysis.model_validate(raw_analysis)
 
         decisions = self._filter_decisions(agent_context)
+        if self._agent_context_snapshot is not None:
+            self._agent_context_snapshot["filter_decisions"] = [
+                self._bounded_context_value(decision.model_dump(mode="json"))
+                for decision in decisions
+            ]
+            self._agent_context_snapshot["structured_result"] = self._bounded_context_value(
+                analysis.model_dump(mode="json")
+            )
+        self._trace(
+            "agent.completed",
+            session_id=session_id,
+            tool_calls=tool_calls,
+            sandbox_runs=len(sandbox_runs),
+            filter_decisions=len(decisions),
+            structured_result=bool(session and session.state and OUTPUT_KEY in session.state),
+        )
         # A rejected tool call is represented as an auditable blocked sandbox run.
         sandbox_runs = self._apply_filter_decisions(sandbox_runs, decisions)
         return analysis, decisions, sandbox_runs, tool_calls
+
+    @staticmethod
+    def _bounded_context_value(value: object, *, depth: int = 0) -> object:
+        """Redact and bound values retained solely for observability."""
+        if depth >= 6:
+            return "[TRUNCATED_NESTING]"
+        if isinstance(value, str):
+            return redact_text(value)[:4000]
+        if isinstance(value, dict):
+            return {
+                redact_text(str(key))[:200]: CodeReviewWorkflow._bounded_context_value(
+                    item,
+                    depth=depth + 1,
+                )
+                for key, item in list(value.items())[:80]
+            }
+        if isinstance(value, (list, tuple)):
+            return [
+                CodeReviewWorkflow._bounded_context_value(item, depth=depth + 1)
+                for item in value[:80]
+            ]
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        return redact_text(str(value))[:4000]
+
+    def _record_agent_event(self, event_type: str, **fields: object) -> None:
+        """Append a bounded event to the optional Agent-context artifact."""
+        if self._agent_context_snapshot is None:
+            return
+        events = self._agent_context_snapshot["events"]
+        if not isinstance(events, list) or len(events) >= 100:
+            return
+        events.append(
+            {
+                "type": event_type,
+                **{
+                    key: self._bounded_context_value(value)
+                    for key, value in fields.items()
+                },
+            }
+        )
+
+    @staticmethod
+    async def _agent_tool_contract(review_agent) -> dict[str, object]:
+        """Return initial tool declarations sent outside the text prompts."""
+        declarations = []
+        try:
+            for toolset in review_agent.tools:
+                get_tools = getattr(toolset, "get_tools", None)
+                if not callable(get_tools):
+                    continue
+                for tool in await get_tools():
+                    if getattr(tool, "name", "") not in SAFE_SKILL_TOOLS:
+                        continue
+                    declaration = tool._get_declaration()
+                    if declaration is not None:
+                        declarations.append(declaration.model_dump(mode="json"))
+        except Exception as error:
+            return {
+                "available_tool_names": sorted(SAFE_SKILL_TOOLS),
+                "declaration_error": redact_text(str(error))[:400],
+            }
+        return {
+            "available_tool_names": sorted(SAFE_SKILL_TOOLS),
+            "declarations": declarations,
+            "skill_content_note": (
+                "The code-review Skill instructions are not in the initial prompt. "
+                "They become visible only in the response to a successful skill_load call."
+            ),
+        }
+
+    @staticmethod
+    def _output_contract() -> dict[str, object]:
+        """Expose the SDK-injected final-response tool and its schema."""
+        declaration = SetModelResponseTool(ReviewAnalysis)._get_declaration()
+        return {
+            "injected_instruction": (
+                "After any required tools, call set_model_response with the final "
+                "answer. Pass the schema fields directly as parameters."
+            ),
+            "declaration": (
+                declaration.model_dump(mode="json")
+                if declaration is not None
+                else None
+            ),
+            "json_schema": ReviewAnalysis.model_json_schema(),
+        }
 
     @staticmethod
     def _filter_decisions(agent_context) -> list[FilterDecision]:
@@ -832,7 +1171,7 @@ class CodeReviewWorkflow:
                 command,
                 payload,
             )
-        if parsed_input.summary.kind != "git_worktree":
+        if parsed_input.summary.kind not in {"git_worktree", "git_commit_range"}:
             return
         is_structured_git_diff = "scripts/review_git_changes.py" in command
         is_git_file_list = "scripts/inspect_git_files.py" in command
@@ -886,7 +1225,7 @@ class CodeReviewWorkflow:
             mode = str(page.get("mode", ""))
             if (
                 int(page.get("cursor", 0)) == 0
-                and mode in {"unstaged", "staged"}
+                and mode in {"unstaged", "staged", "commit"}
                 and mode not in parsed_input.observed_git_modes
             ):
                 summary = page.get("summary", {})

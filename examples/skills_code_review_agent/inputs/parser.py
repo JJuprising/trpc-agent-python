@@ -7,6 +7,7 @@ import importlib.util
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 from functools import lru_cache
 from pathlib import Path
@@ -20,6 +21,10 @@ from .models import ParsedReviewInput
 
 EXAMPLE_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_ROOT = EXAMPLE_ROOT / "tests" / "fixtures"
+# Docker Desktop/WSL deployments may run the daemon in a filesystem namespace
+# where the host's /tmp is not bind-mountable. Keep staged inputs below the
+# repository by default so the Docker daemon can see the exact source path.
+DEFAULT_INPUT_STAGE_DIR = EXAMPLE_ROOT / ".runtime" / "inputs"
 DIFF_PARSER_PATH = (
     EXAMPLE_ROOT / "skills" / "code-review" / "scripts" / "parse_unified_diff.py"
 )
@@ -50,13 +55,28 @@ def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _input_stage_dir() -> Path:
+    """Return a Docker-visible, private parent directory for staged inputs."""
+    configured = os.environ.get("CODE_REVIEW_INPUT_STAGE_DIR", "").strip()
+    stage_dir = Path(configured).expanduser() if configured else DEFAULT_INPUT_STAGE_DIR
+    stage_dir = stage_dir.resolve()
+    stage_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stage_dir.chmod(0o700)
+    return stage_dir
+
+
 def _from_diff(path: Path, kind: str, source: str) -> ParsedReviewInput:
     path = path.resolve()
     if not path.is_file():
         raise ValueError(f"Diff input does not exist: {path}")
     diff_text = _read_limited(path)
     # Mount only a staged copy, never the source file's potentially sensitive parent.
-    staged_root = Path(tempfile.mkdtemp(prefix="code-review-input-"))
+    staged_root = Path(
+        tempfile.mkdtemp(
+            prefix="code-review-input-",
+            dir=_input_stage_dir(),
+        )
+    )
     staged_path = staged_root / path.name
     try:
         shutil.copyfile(path, staged_path)
@@ -208,6 +228,53 @@ def parse_git_worktree(path: Path) -> ParsedReviewInput:
             kind="git_worktree",
             source=str(path),
             digest="pending-sandbox-diff",
+        ),
+        input_root=path,
+        repository_path=path,
+    )
+
+
+COMMIT_REF = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+
+def _ensure_commit_exists(repository: Path, commit: str, label: str) -> None:
+    """Read-only Git plumbing check; never runs repository code."""
+    completed = subprocess.run(
+        ["git", "-C", str(repository), "cat-file", "-e", f"{commit}^{{commit}}"],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise ValueError(f"{label} commit is unavailable in the repository: {commit}")
+
+
+def parse_git_commit_range(
+    path: Path,
+    base_commit: str,
+    head_commit: str,
+) -> ParsedReviewInput:
+    """Validate a committed base..head review range without host-side diffing.
+
+    The repository is mounted read-only like a worktree review; the diff itself
+    is collected inside the sandbox by `review_git_changes.py --mode commit`,
+    keeping the trusted evidence chain intact.
+    """
+    path = path.resolve()
+    if not path.is_dir() or not (path / ".git").exists():
+        raise ValueError(f"Not a Git worktree: {path}")
+    for label, commit in (("base", base_commit), ("head", head_commit)):
+        if not COMMIT_REF.fullmatch(commit):
+            raise ValueError(f"Invalid {label} commit reference: {commit}")
+    _ensure_commit_exists(path, base_commit, "base")
+    _ensure_commit_exists(path, head_commit, "head")
+    return ParsedReviewInput(
+        summary=ReviewInputSummary(
+            kind="git_commit_range",
+            source=str(path),
+            digest="pending-sandbox-diff",
+            base_commit=base_commit,
+            head_commit=head_commit,
         ),
         input_root=path,
         repository_path=path,

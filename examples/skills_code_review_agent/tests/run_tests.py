@@ -29,6 +29,7 @@ from agent.config import ReviewLimits
 from agent.tools import SAFE_SKILL_TOOLS
 from agent.tools import create_skill_tools
 from agent.fake import analyze_with_fake_model
+from agent.model_io import ModelIoRecorder
 from agent.normalization import normalize_analysis
 from agent.normalization import enforce_analysis_scope
 from agent.prompts import build_review_request
@@ -37,6 +38,7 @@ from inputs.parser import parse_diff_text
 from inputs.parser import parse_diff_file
 from inputs.parser import parse_git_worktree
 from inputs.parser import cleanup_parsed_input
+from observability import build_review_run_trace
 from reports.models import ReviewAnalysis
 from reports.models import ReviewFinding
 from reports.models import ReviewReport
@@ -63,6 +65,10 @@ from trpc_agent_sdk.abc import FilterResult
 from trpc_agent_sdk.abc import AgentABC
 from trpc_agent_sdk.abc import SessionABC
 from trpc_agent_sdk.abc import SessionServiceABC
+from trpc_agent_sdk.models import LlmRequest
+from trpc_agent_sdk.models import LlmResponse
+from trpc_agent_sdk.types import Content
+from trpc_agent_sdk.types import Part
 from trpc_agent_sdk.context import InvocationContext
 from trpc_agent_sdk.context import new_agent_context
 from trpc_agent_sdk.code_executors import WorkspaceRunProgramSpec
@@ -1909,6 +1915,227 @@ class FakeWorkflowTests(unittest.TestCase):
             "## Conclusion",
         ):
             self.assertIn(heading, markdown)
+
+    def test_trace_is_saved_beside_report_when_enabled(self) -> None:
+        root = Path(self.temp_dir.name)
+        workflow = CodeReviewWorkflow(
+            model_config=None,
+            sandbox=None,
+            store=self.store,
+            report_writer=ReportWriter(root / "trace-reports"),
+            skills_path=EXAMPLE_ROOT / "skills",
+            trace=True,
+        )
+        result = asyncio.run(
+            workflow.run(ReviewRequest(fixture="clean", fake_model=True))
+        )
+        trajectory = result.artifacts.trajectory_path
+        self.assertIsNotNone(trajectory)
+        self.assertIsNone(result.artifacts.agent_context_path)
+        assert trajectory is not None
+        self.assertEqual(trajectory.parent, result.artifacts.json_path.parent)
+        self.assertEqual(trajectory.name, "trajectory.log")
+        self.assertEqual(trajectory.stat().st_mode & 0o077, 0)
+        trace = trajectory.read_text(encoding="utf-8")
+        self.assertIn("[trace] run.started", trace)
+        self.assertIn("[trace] report.written", trace)
+        self.assertIn("[trace] storage.saved", trace)
+        self.assertIsNotNone(result.artifacts.run_trace_json_path)
+        self.assertIsNotNone(result.artifacts.run_trace_markdown_path)
+        unified = json.loads(
+            result.artifacts.run_trace_json_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(unified["schema_version"], "review-run-trace-v1")
+        self.assertEqual(unified["task_id"], result.report.task_id)
+        self.assertEqual(unified["mode"], "fake")
+        self.assertEqual(len(unified["tool_interactions"]), 1)
+        self.assertEqual(unified["tool_interactions"][0]["tool"], "sandbox_execution")
+
+    def test_agent_context_writer_is_json_and_private(self) -> None:
+        root = Path(self.temp_dir.name)
+        context = {
+            "task_instruction": "Review changed code only.",
+            "events": [{"type": "tool_call", "tool": "skill_run"}],
+        }
+        writer = ReportWriter(root / "context-reports")
+        context_path = writer.write_agent_context("context-task", context)
+        self.assertEqual(context_path.stat().st_mode & 0o077, 0)
+        persisted = json.loads(context_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted, context)
+
+    def test_agent_io_writer_contains_prompts_and_structured_result(self) -> None:
+        root = Path(self.temp_dir.name)
+        writer = ReportWriter(root / "agent-io-reports")
+        io_path = writer.write_agent_io(
+            "agent-io-task",
+            {
+                "system_instruction": "System rule",
+                "task_instruction": "Review this change",
+                "tool_contract": {"available_tool_names": ["skill_load"]},
+                "output_contract": {"injected_instruction": "Call set_model_response"},
+                "events": [
+                    {
+                        "type": "tool_call",
+                        "tool": "skill_load",
+                        "call_id": "call-1",
+                    },
+                    {
+                        "type": "tool_response",
+                        "tool": "skill_load",
+                        "call_id": "call-1",
+                        "response": {"result": "Skill loaded"},
+                    },
+                    {"type": "model_message", "text": "Use the loaded skill"},
+                ],
+                "structured_result": {"summary": "No issue", "findings": []},
+            },
+        )
+        self.assertEqual(io_path.stat().st_mode & 0o077, 0)
+        content = io_path.read_text(encoding="utf-8")
+        self.assertIn("## Round 0 — Initial Request Sent to the Model", content)
+        self.assertIn("### System Prompt", content)
+        self.assertIn("System rule", content)
+        self.assertIn("### Available Tools", content)
+        self.assertIn("skill_load", content)
+        self.assertIn("### Required Final Output", content)
+        self.assertIn("set_model_response", content)
+        self.assertIn("### Task Prompt", content)
+        self.assertIn("Review this change", content)
+        self.assertIn("## Round 1", content)
+        self.assertIn("### Input Received by the Model This Round", content)
+        self.assertIn("Round 0 initial request", content)
+        self.assertIn("### Backend Tool Results Produced After This Round", content)
+        self.assertIn("## Round 2", content)
+        self.assertIn("Skill loaded", content)
+        self.assertIn('"summary": "No issue"', content)
+
+    def test_agent_context_values_are_redacted_and_bounded(self) -> None:
+        value = CodeReviewWorkflow._bounded_context_value(
+            {"token": "sk-abcdefghijklmnopqrstuvwxyz", "large": "x" * 5000}
+        )
+        self.assertEqual(value["token"], "sk-[REDACTED]")
+        self.assertEqual(len(value["large"]), 4000)
+
+    def test_agent_context_exposes_final_output_contract(self) -> None:
+        contract = CodeReviewWorkflow._output_contract()
+        self.assertEqual(contract["declaration"]["name"], "set_model_response")
+        self.assertIn("summary", contract["json_schema"]["properties"])
+        self.assertIn("findings", contract["json_schema"]["properties"])
+
+    def test_model_io_recorder_captures_request_and_terminal_response(self) -> None:
+        recorder = ModelIoRecorder()
+        request = LlmRequest(
+            contents=[Content(role="user", parts=[Part.from_text(text="review me")])]
+        )
+        response = LlmResponse(
+            content=Content(role="model", parts=[Part.from_text(text="done")]),
+            partial=False,
+        )
+        recorder.before_model(None, request)
+        recorder.after_model(None, response)
+        snapshot = recorder.snapshot()
+        self.assertEqual(len(snapshot["calls"]), 1)
+        self.assertEqual(
+            snapshot["calls"][0]["request"]["contents"][0]["parts"][0]["text"],
+            "review me",
+        )
+        self.assertEqual(
+            snapshot["calls"][0]["terminal_response"]["content"]["parts"][0]["text"],
+            "done",
+        )
+
+    def test_agent_io_prefers_callback_captured_model_calls(self) -> None:
+        root = Path(self.temp_dir.name)
+        writer = ReportWriter(root / "captured-io-reports")
+        model_io = {
+            "calls": [
+                {
+                    "call_index": 1,
+                    "request": {
+                        "model": "test-model",
+                        "contents": [
+                            {
+                                "role": "user",
+                                "parts": [{"text": "exact input\nsecond line"}],
+                            }
+                        ],
+                        "config": {"system_instruction": "system one\nsystem two"},
+                    },
+                    "response_chunks": [{"partial": True}],
+                    "terminal_response": {
+                        "content": {
+                            "role": "model",
+                            "parts": [{"text": "exact output\nnext line"}],
+                        }
+                    },
+                }
+            ]
+        }
+        io_path = writer.write_agent_io("captured", {}, model_io)
+        content = io_path.read_text(encoding="utf-8")
+        self.assertIn("# Authoritative SDK Model I/O", content)
+        self.assertIn("### Formatted SDK Request", content)
+        self.assertIn("exact input\nsecond line", content)
+        self.assertIn("exact output\nnext line", content)
+        self.assertNotIn(r"exact input\nsecond line", content)
+        self.assertNotIn("Round 0 initial request", content)
+
+    def test_unified_trace_links_model_tool_and_output_layers(self) -> None:
+        result = self.run_fixture("security")
+        raw_output = {"summary": "raw", "findings": []}
+        model_io = {
+            "calls": [
+                {
+                    "call_index": 1,
+                    "request": {"contents": []},
+                    "response_chunks": [],
+                    "terminal_response": {
+                        "content": {
+                            "parts": [
+                                {
+                                    "function_call": {
+                                        "id": "call-final",
+                                        "name": "set_model_response",
+                                        "args": raw_output,
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                }
+            ]
+        }
+        agent_context = {
+            "events": [
+                {
+                    "type": "tool_call",
+                    "tool": "set_model_response",
+                    "call_id": "call-final",
+                    "arguments": raw_output,
+                },
+                {
+                    "type": "tool_response",
+                    "tool": "set_model_response",
+                    "call_id": "call-final",
+                    "response": raw_output,
+                },
+            ],
+            "structured_result": raw_output,
+        }
+        trace = build_review_run_trace(
+            report=result.report,
+            mode="real-agent",
+            model_io=model_io,
+            agent_context=agent_context,
+            trace_lines=["[trace] run.started"],
+        )
+        final_tool = next(
+            item for item in trace.tool_interactions if item.tool == "set_model_response"
+        )
+        self.assertEqual(final_tool.model_call_index, 1)
+        self.assertEqual(trace.outcome.raw_set_model_response_arguments, raw_output)
+        self.assertEqual(trace.outcome.sdk_validated_agent_output, raw_output)
+        self.assertEqual(trace.outcome.normalized_report_output, result.report.analysis.model_dump(mode="json"))
 
     def test_markdown_escapes_model_controlled_structure(self) -> None:
         result = self.run_fixture("security")

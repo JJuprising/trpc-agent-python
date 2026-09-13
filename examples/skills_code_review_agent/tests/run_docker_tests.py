@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -23,9 +24,56 @@ from trpc_agent_sdk.context import new_agent_context
 from trpc_agent_sdk.sessions import InMemorySessionService
 
 
+async def _probe_input_paths(runtime, invocation, session_id: str) -> None:
+    """Print input mount/link state from inside the live Docker workspace."""
+    workspace = await runtime.manager(invocation).create_workspace(
+        session_id,
+        invocation,
+    )
+    probe_code = """
+import os
+from pathlib import Path
+
+workspace = Path(os.environ["WORKSPACE_DIR"])
+paths = [
+    ("container_mount", Path("/opt/trpc-agent/inputs/security.diff")),
+    ("workspace_input", workspace / "work/inputs/security.diff"),
+    ("skill_input_link", workspace / "skills/code-review/work/inputs/security.diff"),
+    ("relative_from_skill_cwd", Path("work/inputs/security.diff")),
+]
+print(f"cwd={os.getcwd()}")
+print(f"workspace={workspace}")
+for label, path in paths:
+    print(
+        f"{label}: path={path} exists={path.exists()} "
+        f"is_symlink={path.is_symlink()} "
+        f"resolved={path.resolve(strict=False)}"
+    )
+"""
+    result = await runtime.runner(invocation).run_program(
+        workspace,
+        WorkspaceRunProgramSpec(
+            cmd="python3",
+            args=["-c", probe_code],
+            cwd="skills/code-review",
+            timeout=2,
+        ),
+        invocation,
+    )
+    print("[path-probe] input path state:", file=sys.stderr)
+    if result.stdout:
+        print(result.stdout.rstrip(), file=sys.stderr)
+    if result.stderr:
+        print(f"[path-probe] stderr={result.stderr.rstrip()}", file=sys.stderr)
+    print(f"[path-probe] exit_code={result.exit_code}", file=sys.stderr)
+
+
 async def run() -> dict[str, object]:
     """Create isolated test inputs and exercise the Docker-backed Skill."""
-    with tempfile.TemporaryDirectory() as directory:
+    docker_visible_test_root = EXAMPLE_ROOT / ".runtime" / "docker-tests"
+    docker_visible_test_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    docker_visible_test_root.chmod(0o700)
+    with tempfile.TemporaryDirectory(dir=docker_visible_test_root) as directory:
         input_root = Path(directory)
         security_fixture = (
             EXAMPLE_ROOT / "tests" / "fixtures" / "security.diff"
@@ -103,6 +151,8 @@ async def _run(input_root: Path) -> dict[str, object]:
         tool_context=invocation,
         args={"skill_name": "code-review", "include_all_docs": True},
     )
+    if os.environ.get("CODE_REVIEW_PATH_PROBE") == "1":
+        await _probe_input_paths(runtime, invocation, session.id)
     result = await tools["skill_run"].run_async(
         tool_context=invocation,
         args={

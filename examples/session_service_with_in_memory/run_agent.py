@@ -29,13 +29,8 @@ def create_session_service():
     return session_service
 
 
-async def run_weather_agent(session_service: InMemorySessionService):
+async def run_weather_agent(runner: Runner):
     """Run the weather query agent demo"""
-
-    app_name = "weather_agent_demo"
-
-    from agent.agent import root_agent
-    runner = Runner(app_name=app_name, agent=root_agent, session_service=session_service)
 
     user_id = "in_memory_user"
     current_session_id = "in_memory_session_1"
@@ -55,7 +50,7 @@ async def run_weather_agent(session_service: InMemorySessionService):
         # Use a new session for each query
 
         user_content = Content(parts=[Part.from_text(text=query)])
-
+        print(f"👤 User: {query}")
         print("🤖 Assistant: ", end="", flush=True)
         async for event in runner.run_async(user_id=user_id, session_id=current_session_id, new_message=user_content):
             # Check if event.content exists
@@ -85,20 +80,28 @@ async def run_weather_agent(session_service: InMemorySessionService):
 
 async def main():
     session_service = create_session_service()
-    print("=" * 60)
-    print("First run")
-    print("=" * 60)
-    await run_weather_agent(session_service)
-    await asyncio.sleep(2)
-    print("=" * 60)
-    print("Second run")
-    print("=" * 60)
-    await run_weather_agent(session_service)
-    await asyncio.sleep(30)
-    print("=" * 60)
-    print("Third run")
-    print("=" * 60)
-    await run_weather_agent(session_service)
+    from agent.agent import root_agent
+    runner = Runner(app_name="weather_agent_demo", agent=root_agent, session_service=session_service)
+
+    try:
+        print("=" * 60)
+        print("First run")
+        print("=" * 60)
+        await run_weather_agent(runner)
+        await asyncio.sleep(2)
+        print("=" * 60)
+        print("Second run")
+        print("=" * 60)
+        await run_weather_agent(runner)
+        await asyncio.sleep(30)
+        print("=" * 60)
+        print("Third run")
+        print("=" * 60)
+        await run_weather_agent(runner)
+    finally:
+        # Close while the event loop is still alive so HTTP streams and the TTL
+        # cleanup task are not left for interpreter-shutdown finalization.
+        await runner.close()
 
 
 if __name__ == "__main__":

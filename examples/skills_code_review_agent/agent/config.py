@@ -75,13 +75,13 @@ class ReviewLimits:
         max_tool_calls = int(os.getenv("CODE_REVIEW_MAX_TOOL_CALLS", "30"))
         if (
             not math.isfinite(timeout_seconds)
-            or not 0 < timeout_seconds <= 120
+            or not 0 < timeout_seconds <= 900
         ):
             raise ValueError(
-                "CODE_REVIEW_TOTAL_TIMEOUT_SECONDS must be between 0 and 120"
+                "CODE_REVIEW_TOTAL_TIMEOUT_SECONDS must be between 0 and 900"
             )
-        if not 0 < max_tool_calls <= 30:
-            raise ValueError("CODE_REVIEW_MAX_TOOL_CALLS must be between 1 and 30")
+        if not 0 < max_tool_calls <= 80:
+            raise ValueError("CODE_REVIEW_MAX_TOOL_CALLS must be between 1 and 80")
         return cls(
             timeout_seconds=timeout_seconds,
             max_tool_calls=max_tool_calls,

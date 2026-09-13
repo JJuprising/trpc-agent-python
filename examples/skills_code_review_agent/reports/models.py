@@ -20,10 +20,12 @@ class ReviewScope(str, Enum):
 class ReviewInputSummary(BaseModel):
     """Persistable summary of the reviewed input."""
 
-    kind: Literal["diff_file", "file_list", "git_worktree", "fixture"]
+    kind: Literal["diff_file", "file_list", "git_worktree", "git_commit_range", "fixture"]
     source: str = Field(max_length=1024)
     digest: str = Field(max_length=128)
     review_profile: str = Field(default="legacy", max_length=128)
+    base_commit: str | None = Field(default=None, max_length=128)
+    head_commit: str | None = Field(default=None, max_length=128)
     file_count: int = 0
     hunk_count: int = 0
     added_lines: int = 0
@@ -90,6 +92,30 @@ class ReviewFinding(BaseModel):
             return None
         if isinstance(value, str) and value.strip() in {"", "0", "-1", "null", "None"}:
             return None
+        return value
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def normalize_severity_alias(cls, value: object) -> object:
+        """Map common model-emitted severity aliases onto the schema literals."""
+        if isinstance(value, str):
+            alias = value.strip().lower()
+            aliases = {
+                "info": "low",
+                "informational": "low",
+                "notice": "low",
+                "note": "low",
+                "hint": "low",
+                "minor": "low",
+                "suggestion": "low",
+                "warning": "medium",
+                "warn": "medium",
+                "moderate": "medium",
+                "error": "high",
+                "blocker": "critical",
+            }
+            if alias in aliases:
+                return aliases[alias]
         return value
 
 

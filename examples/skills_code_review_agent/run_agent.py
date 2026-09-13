@@ -76,6 +76,16 @@ def build_parser() -> argparse.ArgumentParser:
     inputs.add_argument("--file-list", type=Path, help="newline-delimited relative paths")
     inputs.add_argument("--fixture", help="fixture name under tests/fixtures")
     parser.add_argument(
+        "--commit-range",
+        nargs=2,
+        metavar=("BASE", "HEAD"),
+        default=None,
+        help=(
+            "review the committed base..head diff; requires --repo-path "
+            "and cannot be combined with other inputs"
+        ),
+    )
+    parser.add_argument(
         "--full",
         action="store_true",
         help="review the full tracked repository instead of changed code only",
@@ -106,6 +116,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="simulate sandbox execution while still writing DB and reports",
+    )
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="print a redacted execution trace to stderr",
     )
     return parser
 
@@ -139,10 +154,18 @@ async def run(args: argparse.Namespace) -> None:
         report_writer=ReportWriter(args.output_dir),
         skills_path=EXAMPLE_ROOT / "skills",
         limits=ReviewLimits.from_env(),
+        trace=args.trace,
     )
     repository_path = args.repo_path
+    base_commit, head_commit = args.commit_range or (None, None)
     # With no explicit input, review changed code in the caller's worktree.
-    if not any((repository_path, args.diff_file, args.file_list, args.fixture)):
+    if not any((
+        repository_path,
+        args.diff_file,
+        args.file_list,
+        args.fixture,
+        base_commit,
+    )):
         repository_path = find_git_worktree(Path.cwd())
     result = await workflow.run(
         ReviewRequest(
@@ -150,6 +173,8 @@ async def run(args: argparse.Namespace) -> None:
             diff_file=args.diff_file,
             file_list=args.file_list,
             fixture=args.fixture,
+            base_commit=base_commit,
+            head_commit=head_commit,
             scope=scope,
             fake_model=args.fake_model,
             dry_run=args.dry_run,
@@ -158,6 +183,18 @@ async def run(args: argparse.Namespace) -> None:
     print(f"Review completed: {result.report.task_id}")
     print(f"JSON report: {result.artifacts.json_path}")
     print(f"Markdown report: {result.artifacts.markdown_path}")
+    if result.artifacts.trajectory_path is not None:
+        print(f"Trajectory: {result.artifacts.trajectory_path}")
+    if result.artifacts.agent_context_path is not None:
+        print(f"Agent context: {result.artifacts.agent_context_path}")
+    if result.artifacts.agent_io_path is not None:
+        print(f"Agent prompt and output: {result.artifacts.agent_io_path}")
+    if result.artifacts.model_io_path is not None:
+        print(f"Raw SDK model I/O: {result.artifacts.model_io_path}")
+    if result.artifacts.run_trace_json_path is not None:
+        print(f"Unified trace JSON: {result.artifacts.run_trace_json_path}")
+    if result.artifacts.run_trace_markdown_path is not None:
+        print(f"Unified trace Markdown: {result.artifacts.run_trace_markdown_path}")
 
 
 def main() -> int:

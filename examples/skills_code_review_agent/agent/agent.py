@@ -10,6 +10,7 @@ from filters.policy import ReviewPolicyContext
 from sandbox.base import SandboxProvider
 
 from .config import ModelConfig
+from .model_io import ModelIoRecorder
 from .prompts import INSTRUCTION
 from .tools import create_skill_tools
 
@@ -22,6 +23,7 @@ def create_review_agent(
     repository_path: Path,
     skills_path: Path,
     policy_context: ReviewPolicyContext,
+    model_io_recorder: ModelIoRecorder | None = None,
 ) -> LlmAgent:
     """Create an LLM agent with Docker-backed Skill tools."""
     toolset, skill_repository, _runtime = create_skill_tools(
@@ -44,4 +46,10 @@ def create_review_agent(
         skill_repository=skill_repository,
         output_schema=ReviewAnalysis,
         output_key=OUTPUT_KEY,
+        before_model_callback=(
+            model_io_recorder.before_model if model_io_recorder is not None else None
+        ),
+        after_model_callback=(
+            model_io_recorder.after_model if model_io_recorder is not None else None
+        ),
     )
