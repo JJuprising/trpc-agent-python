@@ -644,9 +644,9 @@ class FakeWorkflowTests(unittest.TestCase):
                 CommandPolicy.from_env()
         with patch.dict(
             os.environ,
-            {"CODE_REVIEW_TOTAL_TIMEOUT_SECONDS": "121"},
+            {"CODE_REVIEW_TOTAL_TIMEOUT_SECONDS": "901"},
         ):
-            with self.assertRaisesRegex(ValueError, "120"):
+            with self.assertRaisesRegex(ValueError, "900"):
                 ReviewLimits.from_env()
         with patch.dict(
             os.environ,

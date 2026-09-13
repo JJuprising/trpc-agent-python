@@ -42,6 +42,7 @@ from inputs.parser import parse_fixture
 from inputs.parser import parse_git_commit_range
 from inputs.parser import parse_git_worktree
 from inputs.parser import cleanup_parsed_input
+from pydantic import ValidationError
 from observability import RunTraceWriter
 from observability import build_review_run_trace
 from reports.models import FilterDecision
@@ -934,10 +935,43 @@ class CodeReviewWorkflow:
             )
         else:
             raw_analysis = session.state[OUTPUT_KEY]
-            if isinstance(raw_analysis, str):
-                analysis = ReviewAnalysis.model_validate_json(raw_analysis)
-            else:
-                analysis = ReviewAnalysis.model_validate(raw_analysis)
+            try:
+                if isinstance(raw_analysis, str):
+                    analysis = ReviewAnalysis.model_validate_json(raw_analysis)
+                else:
+                    analysis = ReviewAnalysis.model_validate(raw_analysis)
+            except ValidationError as error:
+                # 模型最终输出不符合 schema（如提交了 error 形状对象）时，
+                # 降级为有效报告保留本轮证据，而不是让整轮评审 failed。
+                first_error = error.errors()[0]
+                analysis = ReviewAnalysis(
+                    summary=(
+                        "The review agent produced an invalid structured result "
+                        f"({first_error.get('msg', 'schema validation failed')}); "
+                        "its malformed response was not converted into findings."
+                    ),
+                    needs_human_review=[
+                        ReviewFinding(
+                            severity="high",
+                            category="agent_failure",
+                            file="input",
+                            line=None,
+                            title="Structured Agent result failed schema validation",
+                            evidence=(
+                                "The final model response did not match the "
+                                "review_analysis schema. Raw payload type: "
+                                f"{type(raw_analysis).__name__}."
+                            ),
+                            recommendation=(
+                                "Inspect the recorded model I/O and rerun; "
+                                "prefer a model with stricter structured-output "
+                                "compliance."
+                            ),
+                            confidence=1.0,
+                            source="workflow",
+                        )
+                    ],
+                )
 
         decisions = self._filter_decisions(agent_context)
         if self._agent_context_snapshot is not None:
